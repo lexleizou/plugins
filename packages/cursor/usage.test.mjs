@@ -117,8 +117,66 @@ test("a model asked for by its bare name counts in the pool its sized ids are in
   expect(["claude-opus-5-5", counts(cursor, "claude-opus-5-5"), counts(other, "claude-opus-5-5")]).toEqual(["claude-opus-5-5", false, true])
 })
 
-test("an enterprise plan's spend is no window", async () => {
+test("an enterprise plan's spend is no planUsage window", async () => {
   expect((await run(fresh(), () => Response.json({ spendLimitUsage: {} }))).u).toEqual({ windows: [], signIn: "kept" })
+})
+
+const SUMMARY = "https://cursor.com/api/usage-summary"
+const enterprise = (overall = { enabled: true, used: 4945, limit: 80000, remaining: 75055 }) => ({
+  billingCycleEnd: "2026-11-01T00:00:00.000Z",
+  membershipType: "enterprise",
+  limitType: "team",
+  individualUsage: { overall },
+  teamUsage: { onDemand: { enabled: true, used: 0, limit: null, remaining: null } },
+})
+
+test("an enterprise account's overall allowance comes from usage-summary, in dollars with two decimals", async () => {
+  const a = botAuth()
+  const { u, seen } = await run(a, (url) => {
+    if (url === PLAN) return Response.json({})
+    if (url === SUMMARY) return Response.json(enterprise())
+    return Response.json({ billingCycleEnd: "1792925602350" })
+  })
+  expect(u.windows).toEqual([{
+    name: "Enterprise",
+    used: (100 * 4945) / 80000,
+    display: "$49.45 / $800.00",
+    resetsAt: "2026-11-01T00:00:00.000Z",
+  }])
+  expect(seen.find((r) => r.url === SUMMARY)).toEqual({
+    url: SUMMARY,
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Origin: "https://cursor.com",
+      Cookie: "WorkosCursorSessionToken=" + encodeURIComponent("user_test::" + a.access),
+    },
+    redirect: "error",
+  })
+})
+
+test("usage-summary is only asked when planUsage is missing", async () => {
+  const { seen } = await run(auth, (url) =>
+    url === PLAN ? Response.json({}) : Response.json({ planUsage: { autoPercentUsed: 1 } }),
+  )
+  expect(seen.map((r) => r.url)).not.toContain(SUMMARY)
+})
+
+test("an enterprise summary that can't be read leaves the card empty, as before", async () => {
+  for (const reply of [
+    () => new Response("no", { status: 401 }),
+    () => Response.json({ membershipType: "pro", individualUsage: { overall: { enabled: true, used: 1, limit: 2 } } }),
+    () => Response.json(enterprise({ enabled: false, used: 1, limit: 2 })),
+    () => Response.json(enterprise({ enabled: true, used: 1, limit: 0 })),
+    () => new Response("not JSON"),
+  ]) {
+    const { u } = await run(botAuth(), (url) => {
+      if (url === PLAN) return Response.json({})
+      if (url === SUMMARY) return reply()
+      return Response.json({ billingCycleEnd: "1792925602350" })
+    })
+    expect(u).toEqual({ windows: [], signIn: "kept" })
+  }
 })
 
 test("a refused token is the status magpie says", async () => {
