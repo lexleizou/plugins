@@ -567,6 +567,9 @@ async function enterpriseUsage(tok) {
       name: "Enterprise",
       used: Math.max(0, Math.min(100, (100 * used) / limit)),
       display: `${dollars(used / 100)} / ${dollars(limit / 100)}`,
+      amount: used / 100,
+      limit: limit / 100,
+      unit: "USD",
       ...(Number.isFinite(end) ? { resetsAt: new Date(end).toISOString() } : {}),
     }]
   } catch {

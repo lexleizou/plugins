@@ -226,7 +226,9 @@ the pool is.
 An Enterprise account's period has no Cursor Models, Other Models or Total
 in `GetCurrentPeriodUsage`: Cursor reports its overall allowance through
 the website's `usage-summary` instead. Magpie shows that as Enterprise,
-for example `$49.45 / $800.00`, reset at the billing cycle's end.
+for example `$49.45 / $800.00`, reset at the billing cycle's end. Its
+amount and limit are reported separately, so Magpie's Used / Left choice
+turns the dollars and the percentage together.
 
 Sign in to the Cursor account linked in Grok Bot. A linked SuperGrok
 subscription grants Bot access without a paid Cursor plan; see

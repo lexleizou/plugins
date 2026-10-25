@@ -141,6 +141,9 @@ test("an enterprise account's overall allowance comes from usage-summary, in dol
     name: "Enterprise",
     used: (100 * 4945) / 80000,
     display: "$49.45 / $800.00",
+    amount: 49.45,
+    limit: 800,
+    unit: "USD",
     resetsAt: "2026-11-01T00:00:00.000Z",
   }])
   expect(seen.find((r) => r.url === SUMMARY)).toEqual({
