@@ -563,15 +563,35 @@ async function enterpriseUsage(tok) {
     const limit = Number(overall.limit)
     if (!Number.isFinite(used) || !Number.isFinite(limit) || used < 0 || limit <= 0) return undefined
     const end = Date.parse(data.billingCycleEnd ?? "")
-    return [{
+    const resets = Number.isFinite(end) ? { resetsAt: new Date(end).toISOString() } : {}
+    const od = data.teamUsage?.onDemand
+    const spent = typeof od?.used === "number" && Number.isFinite(od.used) && od.used >= 0
+    const unlimited = od?.enabled === true && od.limit === null
+    const fixed = od?.enabled === true && typeof od.limit === "number" && Number.isFinite(od.limit) && od.limit > 0 && spent
+    // Only an explicitly unlimited budget or a measured budget with room
+    // lets a spent included allowance stay available to magpie's routing.
+    const aside = unlimited || (fixed && od.used < od.limit)
+    const windows = [{
       name: "Enterprise",
       used: Math.max(0, Math.min(100, (100 * used) / limit)),
       display: `${dollars(used / 100)} / ${dollars(limit / 100)}`,
       amount: used / 100,
       limit: limit / 100,
       unit: "USD",
-      ...(Number.isFinite(end) ? { resetsAt: new Date(end).toISOString() } : {}),
+      ...resets,
+      ...(aside ? { aside: true } : {}),
     }]
+    if (fixed) windows.push({
+      name: "On-demand",
+      used: Math.min(100, (100 * od.used) / od.limit),
+      display: `${dollars(od.used / 100)} / ${dollars(od.limit / 100)}`,
+      amount: od.used / 100,
+      limit: od.limit / 100,
+      unit: "USD",
+      ...resets,
+    })
+    else if (unlimited && spent) windows.push({ name: "On-demand", used: 0, display: dollars(od.used / 100), ...resets, aside: true })
+    return windows
   } catch {
     return undefined
   }
@@ -599,6 +619,7 @@ async function usage(tok, ids) {
   const data = await res.json()
   const u = data?.planUsage
   if (!u) {
+    // Prefer measured Enterprise usage before any reset-date-only fallback.
     const windows = await enterpriseUsage(tok)
     return windows ? { windows } : { windows: [] }
   }
