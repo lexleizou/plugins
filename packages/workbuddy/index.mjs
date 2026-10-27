@@ -67,6 +67,8 @@ const SITES = {
     authID: "workbuddy-desktop",
     platform: "workbuddy",
     ai: false,
+    // where this build's API keys are made (see keyAccount)
+    keys: "https://www.workbuddy.cn/profile/keys",
     models: CN_MODELS,
     // it serves the Claude models on Anthropic's Messages API too (see
     // nativeOf)
@@ -79,6 +81,7 @@ const SITES = {
     authID: "workbuddy-desktop-ai",
     platform: "workbuddy-ai",
     ai: true,
+    keys: "https://www.workbuddy.ai/profile/keys",
     models: AI_MODELS,
     // models whose images WorkBuddy AI drops though its config says they
     // take them (see textOnly)
@@ -299,7 +302,14 @@ async function refreshed(site, auth) {
 function sign(site, a, headers) {
   headers.set("Authorization", "Bearer " + a.access)
   headers.set("X-User-Id", a.uid ?? "")
-  headers.set("X-Domain", domainOf(site, a))
+  if (a.source === "key") {
+    // the key's own header, and no X-Domain: a key's session has none
+    headers.set("X-API-Key", a.key)
+    headers.delete("X-Domain")
+  } else {
+    headers.delete("X-API-Key")
+    headers.set("X-Domain", domainOf(site, a))
+  }
   headers.set("X-Product", "SaaS")
   headers.set("X-IDE-Type", "WorkBuddy")
   headers.set("User-Agent", "WorkBuddy/" + UA_VERSION)
@@ -312,6 +322,31 @@ function sign(site, a, headers) {
   if (!site.ai) return
   headers.set("X-Agent-Type", "main")
 }
+
+// keyAccount is the account an API key (OpenCode's {type: "api", key}) is
+// sent as, the way WorkBuddy's own CLI sends one (@tencent-ai/codebuddy-code
+// 2.177.0, CODEBUDDY_API_KEY): its API-key sign-in is a session whose access
+// token is the key and whose uid is "anonymous_" and the key's last eight
+// characters (ACC_USER_ID unset), personal, with no domain and no
+// enterprise; and its model requests carry the key twice, X-API-Key and
+// Authorization: Bearer (getCustomHeaders). Its requests go to the build's
+// own host, the one its other sign-ins use: for the China build that is
+// copilot.tencent.com, the CLI's own endpoint for that build
+// (CODEBUDDY_INTERNET_ENVIRONMENT=internal, product.internal.json), and the
+// same API as www.workbuddy.cn, where the keys are made (the CLI's
+// CN_SAAS_CORE_API_FRONT_DOORS); for the international build,
+// www.workbuddy.ai (the CLI's own default, www.codebuddy.ai, is CodeBuddy's,
+// not WorkBuddy's). Nothing renews a key.
+function keyAccount(auth) {
+  const key = typeof auth?.key === "string" ? auth.key.trim() : ""
+  if (!key) return null
+  return { key, access: key, uid: "anonymous_" + key.slice(-8), source: "key" }
+}
+
+// remoteConfig says whether WorkBuddy's own CLI asks /v3/config for the
+// account's models with this key: only for keys that start ck_ or pt_
+// (shouldLoadRemoteConfig); any other key keeps the built-in list.
+const remoteConfig = (key) => /^(ck_|pt_)/.test(key)
 
 // enterpriseHeaders names the enterprise (team) an account signed in as, as
 // WorkBuddy's own client does on every request it makes for that account
@@ -557,6 +592,12 @@ function withoutSignedThinking(body) {
 
 // chatOf is a chat's body as the object it is, null for one that isn't: a
 // body that isn't text (bytes), or isn't JSON at all.
+// bodyString is a body given as bytes, as text; anything else is null.
+function bodyString(body) {
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return new TextDecoder().decode(body)
+  return null
+}
+
 function chatOf(body) {
   if (typeof body !== "string") return null
   try {
@@ -664,6 +705,36 @@ function unflag(messages) {
 // OpenAI-compatible client normally uses max_completion_tokens and may call a
 // reasoning prompt developer; WorkBuddy's endpoint takes max_tokens and
 // system instead.
+// An earlier turn's thinking goes back as `reasoning`, the field WorkBuddy's
+// own client (CodeBuddy's agents converter) sets on an assistant message.
+// WorkBuddy drops `reasoning_content`, which Grok Build, DeepSeek-style
+// clients and magpie's own replies use: measured 2026-10-27 on
+// www.workbuddy.ai, a codeword in reasoning_content reached none of
+// kimi-k2.6, kimi-k3, glm-5.3, deepseek-v4.1-flash and minimax-m3, while
+// the same words as `reasoning` reached kimi-k2.6 and minimax-m3.
+// OpenRouter-style reasoning_details are read for their text the same way.
+function reasoningOf(m) {
+  if (typeof m.reasoning_content === "string" && m.reasoning_content) return m.reasoning_content
+  if (Array.isArray(m.reasoning_details)) {
+    const text = m.reasoning_details.map((d) => (typeof d?.text === "string" ? d.text : typeof d?.summary === "string" ? d.summary : "")).join("")
+    if (text) return text
+  }
+  return ""
+}
+
+function asReasoning(messages) {
+  let changed = false
+  for (const m of messages) {
+    if (m?.role !== "assistant" || (m.reasoning_content === undefined && m.reasoning_details === undefined)) continue
+    const text = reasoningOf(m)
+    if (text && !(typeof m.reasoning === "string" && m.reasoning)) m.reasoning = text
+    delete m.reasoning_content
+    delete m.reasoning_details
+    changed = true
+  }
+  return changed
+}
+
 function withSystem(body) {
   // a body magpie or OpenCode hands over as bytes is read as the text it is
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) body = new TextDecoder().decode(body)
@@ -682,6 +753,7 @@ function withSystem(body) {
       m.role = "system"
       changed = true
     }
+    if (asReasoning(b.messages)) changed = true
     if (b.messages[0]?.role !== "system") {
       b.messages.unshift({ role: "system", content: "You are a helpful assistant." })
       changed = true
@@ -1419,6 +1491,8 @@ async function unanswered(site, a, body, err, signal) {
   if (signal?.aborted || err?.name === "AbortError" || err?.name === "TimeoutError") throw err
   const size = byteLength(body)
   if (size <= EDGE_READS) throw err
+  // the billing API isn't asked with a key: what it answers one is unknown
+  if (a.source === "key") throw err
   let status = 0
   let challenge = ""
   try {
@@ -1544,6 +1618,18 @@ function refusedText(site, a, why, note) {
       ? `Sign in to ${site.name} desktop again; magpie reads its sign-in on the next request.`
       : `Sign in to it again in magpie: Providers → ${site.name} → this account's Sign in again.`)
   )
+}
+
+// keyRefused is the answer to a request WorkBuddy refused an API key for
+// (401): a key isn't renewed, so it says to check the key. Marked expired
+// only on WorkBuddy's word that the token itself is refused (invalidToken).
+function keyRefused(site, expired, note) {
+  const message = `${site.name} refused this API key (401). ${note ? note + " " : ""}Check the key at ${site.keys}, then add it again in magpie: Providers → ${site.name}.`
+  return new Response(JSON.stringify({ error: { message, type: "authentication_error", code: 401 } }), {
+    status: 401,
+    statusText: "Unauthorized",
+    headers: { "content-type": "application/json", "X-Magpie-Sign-In": expired ? "expired" : "kept" },
+  })
 }
 
 // signedOut is the answer to a request WorkBuddy refused this account's
@@ -1717,6 +1803,45 @@ function runsOutOf(sum, packages, now = Date.now()) {
     else if (end === at) amount += left
   }
   return at ? { runsOutAt: new Date(at).toISOString(), runsOut: amount } : null
+}
+
+// cycleOf is when the plan's credits start again, as WorkBuddy's own client
+// says it (getCurrentPlan's refreshAt): the cycle end of the package the
+// summary names as the subscription (SubscriptionPackageCode), in UTC+8,
+// with how long the cycle is. Without it the card had used credits and no
+// reset, and magpie said "Not used yet" beside 46% (windy on Discord,
+// 2026-10-26). null when the subscription isn't in the lists, or its cycle
+// is over.
+function cycleOf(sum, packages, now = Date.now()) {
+  const code = sum?.SubscriptionPackageCode
+  const at = (v) => (typeof v === "string" && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v.trim()) ? Date.parse(v.trim().replace(" ", "T") + "+08:00") : 0)
+  const of = (p) => {
+    const end = at(p?.CycleEndTime), start = at(p?.CycleStartTime)
+    if (!(end > now)) return null
+    return { resetsAt: new Date(end).toISOString(), ...(start > 0 && start < end ? { span: (end - start) / 1000 } : {}) }
+  }
+  // A summary that does name one goes by it alone: named and not listed, or
+  // its cycle over, is unknown — a paid plan's cycle is its subscription's,
+  // never the slice's (yetone, #415).
+  if (code) {
+    for (const p of packages ?? []) if (p?.PackageCode === code) return of(p)
+    return null
+  }
+  // A free account's summary names no subscription at all: both sites answer
+  // SubscriptionPackageCode "" (copilot.tencent.com and www.workbuddy.ai,
+  // measured 2026-10-26 on eight CN accounts and one AI one), so this
+  // returned null and the card of an account whose credits are being spent
+  // said nothing of when they come back — the one thing cycleOf is for.
+  //
+  // Its plan's own credits are the slice (CapacityType 4): packagesOf's
+  // free list returns a month's plan_base with it, 00:00:00 to 23:59:59
+  // UTC+8, the same cycle on every account on both sites (500 credits on
+  // the CN site, 100 on the international), and its CycleEndTime is when
+  // the plan gives the next month's back. A slice tells no account apart,
+  // which is why runsOutOf keeps it out: which account to spend first is a
+  // different question from when the plan refills.
+  for (const p of packages ?? []) if (String(p?.CapacityType) === SLICE) return of(p)
+  return null
 }
 
 // ---- models -----------------------------------------------------------------
@@ -1939,6 +2064,29 @@ function replyAfterTools(body) {
   return JSON.stringify(b)
 }
 
+// FREE_ONLY is the switch that keeps an account off credits (#430): its
+// list holds only the models WorkBuddy serves at no cost (priceOf's free),
+// and a request for any other is answered here, never sent. A price that
+// can't be read is not free, and a list that can't be read sends nothing.
+const FREE_ONLY = "free_only"
+// PRICE_TTL is how long a list read for that check is used before it is
+// read again: a promotion that ends stops counting as free within it.
+const PRICE_TTL = 60_000
+
+// notFree is the answer to a request the switch keeps from WorkBuddy. Its
+// words say the model, not the account, is what is turned away, so magpie
+// rests that model alone and asks another provider of it; they name no
+// quota or credit, which would rest the whole account as out of credit.
+function notFree(site, model, why) {
+  const msg = why
+    ? `${site.name}'s model list couldn't be read (${why}), so whether model ${model || "(none)"} is free is unknown; with "Free models only" on it isn't sent`
+    : `model ${model || "(none)"} is not available while "Free models only" is on: ${site.name} charges for it. Turn the switch off in ${site.name}'s provider settings to use it`
+  return new Response(JSON.stringify({ error: { message: msg, type: "invalid_request_error", code: why ? "free_only_unknown" : "model_not_found" } }), {
+    status: why ? 503 : 404,
+    headers: { "content-type": "application/json", "X-Magpie-Sign-In": "kept" },
+  })
+}
+
 function makePlugin(site) {
   // the models of this site that refused tool results then the user's
   // message, for this run: their next chats go with replyAfterTools at once
@@ -1946,7 +2094,30 @@ function makePlugin(site) {
   // the system prompts this run WorkBuddy refused as an unapproved channel:
   // their next chats go with systemAsUser at once, not refused first
   const refusedSystems = new Set()
-  return async ({ client }) => ({
+  return async ({ client, magpie }) => {
+  // each account's list as last read, for FREE_ONLY: {at, list}
+  const lists = new Map()
+  const listKey = (a) => `${a.uid ?? ""}|${a.enterpriseId ?? ""}|${a.source === "key" ? a.key : ""}`
+  // listed is the account's live list, read again past PRICE_TTL
+  const listed = async (a, fresh = false) => {
+    const k = listKey(a)
+    const was = lists.get(k)
+    if (!fresh && was && Date.now() - was.at < PRICE_TTL) return was.list
+    const list = await liveModels(site, a)
+    lists.set(k, { at: Date.now(), list })
+    if (lists.size > 64) lists.delete(lists.keys().next().value)
+    return list
+  }
+  const freeOnly = () => magpie?.option?.(site.id, FREE_ONLY) === true
+  // onlyFree is a list with the switch on: its free models, or a failure
+  // when there are none to tell (magpie then keeps the list it had)
+  const onlyFree = (ms) => {
+    if (!freeOnly()) return ms
+    const free = ms.filter((m) => m.free)
+    if (!free.length) throw new Error(`${site.name} lists no free model, and "Free models only" is on`)
+    return free
+  }
+  return {
     config: async (config) => {
       config.provider ??= {}
       config.provider[site.id] ??= {}
@@ -1968,15 +2139,37 @@ function makePlugin(site) {
       // the account's own list, when it's signed in and WorkBuddy answers;
       // else the list above
       async models(provider, { auth }) {
+        if (auth?.type === "api") {
+          // asked as WorkBuddy's own CLI asks with a key (remoteConfig)
+          const a = keyAccount(auth)
+          if (!a || !remoteConfig(a.key)) {
+            if (freeOnly()) throw new Error(`${site.name} lists no prices for this key, and "Free models only" is on`)
+            return provider.models
+          }
+          let ms
+          try {
+            ms = await listed(a, true)
+          } catch (e) {
+            if (freeOnly()) throw e
+            return provider.models
+          }
+          if (!ms.length && !freeOnly()) return provider.models
+          return Object.fromEntries(onlyFree(ms).map((m) => [m.id, modelOf(site, provider, m)]))
+        }
         if (auth?.type !== "oauth" || !(auth.access || auth.source)) return provider.models
+        let ms
         try {
           const a = await current(site, client, auth)
-          const ms = await liveModels(site, a)
-          if (!ms.length) return provider.models
-          return Object.fromEntries(ms.map((m) => [m.id, modelOf(site, provider, m)]))
-        } catch {
+          ms = await listed(a, true)
+        } catch (e) {
+          // with the switch on, a list without prices would offer models
+          // that cost credits: the failure goes up, and magpie keeps the
+          // list it had
+          if (freeOnly()) throw e
           return provider.models
         }
+        if (!ms.length && !freeOnly()) return provider.models
+        return Object.fromEntries(onlyFree(ms).map((m) => [m.id, modelOf(site, provider, m)]))
       },
     },
     auth: {
@@ -1988,9 +2181,16 @@ function makePlugin(site) {
       // and is renewed as before.
       refreshLead: LEAD_MS,
       refresh: (auth) => refreshed(site, auth),
+      options: [
+        {
+          key: FREE_ONLY,
+          label: "Free models only",
+          description: `Lists only the models ${site.name} serves at no cost, and turns away a request for any other here instead of sending it, so no credits are spent. A model free only at night counts as paid.`,
+        },
+      ],
       async loader(getAuth) {
         const auth = await getAuth()
-        if (auth?.type !== "oauth") return {}
+        if (auth?.type !== "oauth" && auth?.type !== "api") return {}
         return {
           // no baseURL: a model's own api.url says where it is served —
           // <endpoint>/v2 for a chat, <endpoint>/v1 for a Claude model on
@@ -1999,8 +2199,9 @@ function makePlugin(site) {
           apiKey: "",
           async fetch(input, init) {
             const stored = await getAuth()
-            if (stored?.type !== "oauth") throw new Error(`${site.name} isn't signed in`)
-            let a = await current(site, client, stored)
+            const keyed = stored?.type === "api" ? keyAccount(stored) : null
+            if (stored?.type !== "oauth" && !keyed) throw new Error(`${site.name} isn't signed in`)
+            let a = keyed ?? (await current(site, client, stored))
             const req = input instanceof Request ? input : null
             const headers = new Headers(init?.headers ?? req?.headers)
             headers.delete("authorization")
@@ -2010,6 +2211,18 @@ function makePlugin(site) {
             sign(site, a, headers)
             let body = init?.body
             if (body === undefined && req) body = await req.clone().text()
+            // the switch is checked before anything is sent: a model not
+            // free, or one whose price can't be read, never reaches WorkBuddy
+            if (freeOnly()) {
+              const model = chatOf(typeof body === "string" ? body : bodyString(body))?.model
+              let list
+              try {
+                list = await listed(a)
+              } catch (e) {
+                return notFree(site, model, e?.message ?? String(e))
+              }
+              if (!list.some((m) => m.id === model && m.free)) return notFree(site, model)
+            }
             // An Anthropic request goes as the agent sent it: WorkBuddy
             // serves these models on Messages itself, and the rewrites
             // below (a default system message, the chat endpoint's
@@ -2057,6 +2270,12 @@ function makePlugin(site) {
               const res = await post(b)
               if (res.status !== 401) return res
               if (renewed) return out("it refused the token renewed for it too", invalidToken(res), res)
+              // a key isn't renewed: the 401 says the key was refused
+              if (a.source === "key") {
+                const r = keyRefused(site, invalidToken(res), edgeNotes.get(res))
+                ours.add(r)
+                return r
+              }
               if (!resendable(b)) return res
               await res.body?.cancel().catch(() => {})
               const r = await reissued(site, client, getAuth, a, stored.access)
@@ -2121,6 +2340,9 @@ function makePlugin(site) {
       // an account lapsed nor cleared it, but for a 401 (gone, below)
       async usage(getAuth) {
         const auth = await getAuth()
+        // WorkBuddy's own CLI reads no credits with a key, and what the
+        // billing API answers one is unknown, so a key's card says so
+        if (auth?.type === "api") return { error: `credits unknown with an API key (WorkBuddy's own client reads none with one); see ${site.keys.replace(/\/profile\/keys$/, "")}`, signIn: "kept" }
         if (auth?.type !== "oauth" || !(auth.access || auth.source)) return { error: "not signed in", signIn: "kept" }
         try {
           let a = await current(site, client, auth)
@@ -2159,12 +2381,14 @@ function makePlugin(site) {
             } catch {}
             if (ent) return { plan: auth.plan || "Enterprise", windows: await spareFree(site, a, [ent]), signIn: said }
           }
-          // when the credits left run out, for routing to spend them first;
+          // when the plan's credits start again (cycleOf), and when the credits
+          // left run out, for routing to spend them first (runsOutOf);
           // a list that can't be read leaves it unknown, the card stands
           const credits = out.windows.find((w) => w.name === "Credits")
           if (credits) {
             try {
-              Object.assign(credits, runsOutOf(sum, await packagesOf(site, a)) ?? {})
+              const packages = await packagesOf(site, a)
+              Object.assign(credits, cycleOf(sum, packages) ?? {}, runsOutOf(sum, packages) ?? {})
             } catch {}
           }
           await spareFree(site, a, out.windows)
@@ -2184,9 +2408,17 @@ function makePlugin(site) {
           label: `${site.name} desktop's sign-in`,
           authorize: async () => desktopSignIn(site),
         },
+        {
+          // a key made at site.keys, sent as WorkBuddy's CLI sends one
+          // (keyAccount)
+          type: "api",
+          label: `${site.name} API key`,
+          placeholder: `from ${site.keys.replace(/^https:\/\//, "")}`,
+        },
       ],
     },
-  })
+  }
+  }
 }
 
 // REFUSED_HINT is what the user can do about WorkBuddy's "Illegal API
@@ -2291,4 +2523,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }

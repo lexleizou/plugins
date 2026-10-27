@@ -158,13 +158,28 @@ itself.
 |---|---|
 | A refused sign-in (no code, or code 105) | 401 |
 | A quota (codes 110, 112–119, 122) | 429 |
-| Busy or queued for the model (code 10605) | Since 0.2.28 the request waits in Qoder's queue as Qoder's client does (below), then is sent again; past the wait, 503 with `Retry-After` from Qoder's `retryAfterSeconds` (30s when it gives none). The sign-in is untouched |
+| Busy or queued for the model (code 10605) | Since 0.2.28 the request waits in Qoder's queue as Qoder's client does (below), then is sent again; past the wait, 503 with `Retry-After` from Qoder's `retryAfterSeconds` (30s when it gives none). Since 0.2.40, when magpie has another candidate after this request (`x-magpie-fallback: 1`), the 503 comes at once, saying the queue and how many are ahead, and magpie asks the next. The sign-in is untouched |
 | A refusal of the request itself (codes 406, 416, 430, 80411, 80412, 100400–100403) | 400, with Qoder's words |
 | "Error in upstream response", the model's own vendor behind Qoder failing, which Qoder sends as a 400 (since 0.2.24) | 502, so magpie asks again or another account; the sign-in is untouched |
 | A failure before the answer starts | Qoder's status |
 | A failure after the answer has started | The stream ends with an error |
 
 ## Models
+
+Chat responses report the display name from the same model-list entry
+used to build the request, in both JSON completions and every SSE chunk
+(including usage). A blank name or a name equal to the slot key falls
+back to the requested model ID. This shared behavior applies to Qoder,
+Qoder CN, QwenWork and QwenWork Enterprise, including tier labels.
+
+Reporting the name does not fetch the model list again. The existing
+cache and model-list refresh behavior remain in place: a model missing
+from the cache still forces a refresh, and normal list refreshes update
+the configuration and name together. Model-list keys, API IDs,
+`X-Model-Key` and `model_config` are unchanged; slots with the same display
+name remain independently selectable. The name describes the catalog
+entry used for the request, not an attestation of the backend that
+executed it.
 
 The `provider.models` hook reads the account's own list, as Qoder's client
 asks for it (`/algo/api/v2/model/list`). It keeps the enabled models of the
@@ -411,6 +426,14 @@ reaches the agent meanwhile (magpie keeps a stream alive with comments for
 cancelled request end the wait early. Qoder's client also reports the end
 of its turn to `/api/v2/service/ask/finish`; the plugin doesn't, and
 Qoder releases that lease on its own TTL. `queue.test.mjs` has the wait.
+
+Since **0.2.40** the wait is only for the last candidate: when magpie says
+another account, provider or routing group member follows this request
+(its `x-magpie-fallback: 1` header, which the plugin host keeps from Qoder),
+a queued request is answered at once with the 503 above, e.g. "Qoder queued
+the request for dfmodel (this plan's queue: p3, 3 ahead); try again in
+30s", and magpie asks the next instead of keeping the agent in Qoder's
+queue.
 
 For a bounded offline reproduction, run `packages/qoder/busy.test.mjs`
 from #185 in an isolated temporary HOME. It compares plain queue JSON,
