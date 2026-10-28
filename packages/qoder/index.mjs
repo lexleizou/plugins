@@ -792,6 +792,28 @@ function callID(at, k, c) {
   return "call_" + createHash("sha256").update(`${at}\0${k}\0${c.function?.name ?? ""}\0${said}`).digest("hex").slice(0, 32)
 }
 
+// reasoningOf is the thinking an assistant turn of the chat carries back:
+// reasoning_content (DeepSeek's spelling, which magpie and most clients
+// send), else reasoning (OpenRouter's), else reasoning_details' text, ""
+// when it carries none.
+function reasoningOf(m) {
+  let text = ""
+  for (const k of ["reasoning_content", "reasoning"]) if (!text && typeof m[k] === "string") text = m[k]
+  if (!text && Array.isArray(m.reasoning_details)) text = m.reasoning_details.map((d) => (typeof d?.text === "string" ? d.text : typeof d?.summary === "string" ? d.summary : "")).join("")
+  // A blank one (magpie's gateway sends " " for a tool turn with no
+  // thinking) is no thinking at all.
+  return text.trim() ? text : ""
+}
+
+// An assistant turn's thinking goes back in reasoning_content, as Qoder's
+// own client sends it (qoder-agent-sdk, Qoder.app 0.x: its converter sets
+// reasoning_content on every earlier assistant turn that had thinking).
+// It was left out from the plugin's first version on, so a model behind
+// Qoder never saw what it had thought on the turns before (uk.jent on
+// Discord): on Qoder, DeepSeek-V4-Pro in a tool loop now recalls what its
+// thinking before the call said, and said it had none without it. A turn
+// with thinking and nothing else is still left out, as that client leaves
+// it.
 function qoderMessages(msgs) {
   const out = []
   const names = {}
@@ -850,7 +872,8 @@ function qoderMessages(msgs) {
         const args = c.function?.arguments
         return { id, type: "function", function: { name: c.function?.name, arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}) } }
       })
-      out.push({ role: "assistant", content: textOf(m.content), tool_calls: calls })
+      const think = reasoningOf(m)
+      out.push({ role: "assistant", content: textOf(m.content), ...(think ? { reasoning_content: think } : {}), tool_calls: calls })
       const open = calls.map((c) => c.id)
       const kept = new Set()
       for (let j = i + 1; j < msgs.length && msgs[j].role === "tool"; j++) {
@@ -864,7 +887,8 @@ function qoderMessages(msgs) {
     if (m.role === "assistant") blocks = blocks.filter((b) => b.type === "text")
     if (!blocks.length) continue
     if (m.role === "user" && seen.length) [blocks, seen] = [[...seen, ...blocks], []]
-    out.push({ role: m.role, content: blocks })
+    const think = m.role === "assistant" ? reasoningOf(m) : ""
+    out.push({ role: m.role, content: blocks, ...(think ? { reasoning_content: think } : {}) })
     // a result after the assistant's own words answers no call before it
     turn = null
   }
@@ -2065,6 +2089,36 @@ function gfmt(n) {
 
 const RFC3339 = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/i
 
+// Qoder's daily credits are a campaign of their own each day, listed from
+// 10:00 (UTC+8) to 09:59 the next day: its startAt and endAt, and its own
+// words, "Daily reset: 10:00 (UTC+8)" (a live list, 2026-10-28; sdytman on
+// Discord: qoder每天10点开始签到). So the check-in's day is the campaign's,
+// not the calendar's in any zone: a check-in before 10:00 meets the day
+// before's campaign, and the next one opens a day after that one's start,
+// a minute after its end. A check-in says when (until, RFC 3339), and
+// magpie asks again then, whatever the machine's time zone.
+const DAY_MS = 86_400_000
+// a minute's room for a computer clock that runs ahead of Qoder's
+const OPEN_ROOM_MS = 60_000
+
+// at is a time Qoder gives, in seconds or milliseconds, as milliseconds.
+const at = (v) => {
+  const n = Number(v)
+  if (v === null || v === undefined || v === "" || !Number.isFinite(n) || n <= 0) return undefined
+  return n > 1e12 ? n : n * 1000
+}
+
+// nextOpens is when the campaign after c is expected to open: a day after
+// c's start, or c's end when it runs longer than a day.
+const nextOpens = (c) => {
+  const start = at(c?.startAt), end = at(c?.endAt)
+  if (end === undefined) return undefined
+  return start === undefined ? end : Math.max(end, start + DAY_MS)
+}
+
+// askAgain is a check-in's until: when to ask again, with room.
+const askAgain = (t) => (Number.isFinite(t) ? { until: new Date(t + OPEN_ROOM_MS).toISOString() } : {})
+
 // when is a time Qoder gives: an RFC 3339 string, else seconds or
 // milliseconds, as a number or its text.
 function when(v) {
@@ -2074,7 +2128,20 @@ function when(v) {
   return new Date(Math.trunc(n < 1e12 ? n * 1000 : n)).toISOString()
 }
 
-// parseUsage is the plan and each pool of credits the envelope tells.
+// SPENT_IN_TURN are the pools Qoder spends one after another before an
+// account stops: the plan's credits, the account's own add-on credits and,
+// on a team, the organisation's shared add-on credits (docs.qoder.com/Credits
+// and account/teams/shared-add-on-credits: the soonest to expire first, the
+// plan's before add-on on the same day). The envelope's own
+// totalUsagePercentage counts them as one too. So the account has left what
+// they have left together: a plan used up beside add-on credits is no
+// account used up (magpie-community/plugins#454).
+const SPENT_IN_TURN = new Set(["Credits", "Add-on credits", "Shared credits"])
+
+// parseUsage is the plan and each pool of credits the envelope tells. When
+// more than one of the pools spent in turn holds credits, "Total credits"
+// is what they hold together, the one routing counts, and each pool is
+// shown beside it, set aside.
 function parseUsage(env) {
   if (env.displayMode === "enterprise") return { plan: "Enterprise" }
   const u = env.qoderUsage
@@ -2094,13 +2161,33 @@ function parseUsage(env) {
     if (total == null || total <= 0 || (b.used == null && b.remaining == null)) return
     const used = b.used != null ? b.used : total - b.remaining
     if (used < 0) return
-    out.windows.push({ name: b.name || name, used: Math.min(100, (100 * used) / total), display: `${gfmt(used)} / ${gfmt(total)} ${b.unit || "credits"}` })
+    const unit = b.unit || "credits"
+    const w = { name: b.name || name, used: Math.min(100, (100 * used) / total), display: `${gfmt(used)} / ${gfmt(total)} ${unit}` }
+    out.windows.push(w)
+    if (SPENT_IN_TURN.has(name)) turn.push({ w, used: Math.min(used, total), total, unit })
   }
+  const turn = []
   add(field("userQuota", "user_quota"), "Credits")
   add(field("addOnQuota", "add_on_quota"), "Add-on credits")
   add(field("orgResourcePackage", "org_resource_package"), "Shared credits")
+  // one count only when every pool counts in the same unit
+  if (turn.length > 1 && turn.every((p) => p.unit === turn[0].unit)) {
+    const used = turn.reduce((a, p) => a + p.used, 0)
+    const total = turn.reduce((a, p) => a + p.total, 0)
+    for (const p of turn) p.w.aside = true
+    out.windows.unshift({ name: "Total credits", used: Math.min(100, (100 * used) / total), display: `${gfmt(used)} / ${gfmt(total)} ${turn[0].unit}` })
+  }
   const dedicated = field("dedicatedResourcePackages", "dedicated_resource_packages")
   for (const b of Array.isArray(dedicated) ? dedicated : []) add(b, "Dedicated credits")
+  // A free account (personal_standard) with no add-on credits has a plan of
+  // 0 and nothing else: Qoder's client shows that pool as 0/0 and counts the
+  // account as out of credits. Without a window of its own magpie showed no
+  // credits at all (Ariel on Discord), so it reads as none left.
+  if (out.windows.length === 0) {
+    const zero = (b) => b !== null && typeof b === "object" && !Array.isArray(b) && (b.total ?? b.cap) === 0
+    const pools = [field("userQuota", "user_quota"), field("addOnQuota", "add_on_quota"), field("orgResourcePackage", "org_resource_package")]
+    if (pools.some(zero)) out.windows.push({ name: "Credits", used: 100, display: "0 credits left" })
+  }
   return out
 }
 
@@ -2428,6 +2515,26 @@ const makePlugin = (site) => async ({ client }) => {
       return dt.token
     })
 
+  // spareFree has the credit windows not count the models that cost none
+  // (notModels): Qoder's own docs say "When Credits run out, you can
+  // continue using free basic models, subject to daily and monthly limits"
+  // (docs.qoder.com/Credits; the zh page the same: "Credits 用尽后，仍可使用
+  // 免费基础模型"). Counted, a plan used up (or a free account's "0 credits
+  // left") put the account last for Qwen3.8-Flash and DeepSeek-Flash too,
+  // which it still serves (coeo91 on Discord). Free is the listing's own
+  // price (freeOf: 0×, not a discount's 0 for a while). A listing that can't
+  // be read leaves every model counted, as before. Qoder and Qoder CN only:
+  // QwenWork reads its usage elsewhere and says nothing of free models.
+  const spareFree = async (cred, out) => {
+    if (!out?.windows?.length) return out
+    let free = []
+    try {
+      free = (await models(cred)).filter((m) => m.free).map((m) => m.key)
+    } catch {}
+    if (free.length) for (const w of out.windows) w.notModels = free
+    return out
+  }
+
   // usage is the account's allowance, magpie's own hook. signIn is what the read means for the sign-in, as the built-in's did:
   // a refused job refresh marks it, a renewed one clears it, and nothing
   // else does — not a clean read, nor a refused device token, which serves
@@ -2475,7 +2582,7 @@ const makePlugin = (site) => async ({ client }) => {
       // no second token here to rotate and retry with.
       if (cred.patAuth && !cred.deviceToken) {
         const env = await fetchUsage(siteOf(site, cred), cred.access)
-        return { ...parseUsage(env), signIn }
+        return { ...(await spareFree(cred, parseUsage(env))), signIn }
       }
       let env
       try {
@@ -2484,7 +2591,7 @@ const makePlugin = (site) => async ({ client }) => {
         if (!(e instanceof UsageStatus) || (e.status !== 401 && e.status !== 403)) throw e
         env = await fetchUsage(siteOf(site, cred), await deviceToken(getAuth, cred.deviceToken))
       }
-      return { ...parseUsage(env), signIn }
+      return { ...(await spareFree(cred, parseUsage(env))), signIn }
     } catch (e) {
       return { error: e?.message ?? String(e), signIn: e?.expired ? "expired" : signIn }
     }
@@ -2562,16 +2669,21 @@ const makePlugin = (site) => async ({ client }) => {
       }
       if (listRes.status !== 200) return { outcome: "failed", message: `campaigns: HTTP ${listRes.status}` }
       const now = Date.now()
-      const active = (c) => (!c.startAt || c.startAt * 1000 <= now) && (!c.endAt || c.endAt * 1000 > now)
+      const active = (c) => (at(c.startAt) ?? -Infinity) <= now && now < (at(c.endAt) ?? Infinity)
       const campaigns = (Array.isArray(list.campaigns) ? list.campaigns : []).filter((x) => x?.actionType === "CLAIM_BENEFIT")
       const campaign = campaigns.find((x) => x.claimStatus === "CLAIMABLE")
       if (!campaign) {
         const done = campaigns.find((x) => x.claimStatus === "CLAIMED" && active(x))
         if (done) {
           const amount = Number(done.benefit?.amount)
-          return { outcome: "done", ...(Number.isFinite(amount) && amount > 0 ? { credit: amount } : {}) }
+          return { outcome: "done", ...(Number.isFinite(amount) && amount > 0 ? { credit: amount } : {}), ...askAgain(nextOpens(done)) }
         }
-        if (campaigns.length) return { outcome: "failed", message: "campaigns: today's credits aren't offered yet" }
+        // the next day's credits open at a time the list says: ask then,
+        // not half an hour later
+        if (campaigns.length) {
+          const next = Math.min(...campaigns.flatMap((c) => [at(c.startAt), nextOpens(c)]).filter((t) => t > now))
+          return { outcome: "failed", message: "campaigns: today's credits aren't offered yet", ...askAgain(next) }
+        }
         // Asked without Qoder CN's identity and offered nothing: what an
         // international list says to a request without one, so say why
         // (no Qoder CN on this machine) or ask again (it didn't answer).
@@ -2596,7 +2708,7 @@ const makePlugin = (site) => async ({ client }) => {
       if (claimRes.status !== 200) return { outcome: "failed", message: `claim: HTTP ${claimRes.status}` }
       if (said === "CLAIMED") {
         const amount = Number(claim?.benefit?.amount ?? claim?.data?.benefit?.amount ?? campaign.benefit?.amount)
-        return { outcome: "claimed", ...(Number.isFinite(amount) && amount > 0 ? { credit: amount } : {}) }
+        return { outcome: "claimed", ...(Number.isFinite(amount) && amount > 0 ? { credit: amount } : {}), ...askAgain(nextOpens(campaign)) }
       }
       return { outcome: "failed", message: `claim: ${said || "unknown answer"}` }
     } catch (e) {
