@@ -559,9 +559,9 @@ async function enterpriseUsage(tok) {
     if (String(data?.membershipType).toLowerCase() !== "enterprise") return undefined
     const overall = data?.individualUsage?.overall
     if (overall?.enabled !== true) return undefined
-    const used = Number(overall.used)
-    const limit = Number(overall.limit)
-    if (!Number.isFinite(used) || !Number.isFinite(limit) || used < 0 || limit <= 0) return undefined
+    const { used, limit } = overall
+    if (typeof used !== "number" || !Number.isFinite(used) || used < 0) return undefined
+    if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) return undefined
     const end = Date.parse(data.billingCycleEnd ?? "")
     const resets = Number.isFinite(end) ? { resetsAt: new Date(end).toISOString() } : {}
     const od = data.teamUsage?.onDemand

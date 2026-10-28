@@ -235,6 +235,15 @@ test("an enterprise summary that can't be read leaves the card empty, as before"
     () => Response.json({ membershipType: "pro", individualUsage: { overall: { enabled: true, used: 1, limit: 2 } } }),
     () => Response.json(enterprise({ enabled: false, used: 1, limit: 2 })),
     () => Response.json(enterprise({ enabled: true, used: 1, limit: 0 })),
+    ...["used", "limit"].flatMap((field) =>
+      [undefined, null, "", false, true, [], [1], {}, "0", "80000", -1].map((value) =>
+        () => Response.json(enterprise({ enabled: true, used: 4945, limit: 80000, [field]: value })),
+      ),
+    ),
+    // JSON permits exponents that overflow JavaScript's finite numbers.
+    ...["used", "limit"].flatMap((field) => ["1e400", "-1e400"].map((value) =>
+      () => new Response(`{"membershipType":"enterprise","individualUsage":{"overall":{"enabled":true,"used":${field === "used" ? value : 4945},"limit":${field === "limit" ? value : 80000}}}}`),
+    )),
     () => new Response("not JSON"),
   ]) {
     const { u } = await run(botAuth(), (url) => {
@@ -244,6 +253,16 @@ test("an enterprise summary that can't be read leaves the card empty, as before"
     })
     expect(u).toEqual({ windows: [], signIn: "kept" })
   }
+})
+
+test("an enterprise summary with numeric zero used still shows the full allowance", async () => {
+  const { u } = await run(botAuth(), (url) => Response.json(
+    url === SUMMARY ? enterprise({ enabled: true, used: 0, limit: 80000 }) : {},
+  ))
+  expect(u.windows[0]).toEqual({
+    name: "Enterprise", used: 0, display: "$0.00 / $800.00",
+    amount: 0, limit: 800, unit: "USD", resetsAt: "2026-11-01T00:00:00.000Z", aside: true,
+  })
 })
 
 test("a refused token is the status magpie says", async () => {
